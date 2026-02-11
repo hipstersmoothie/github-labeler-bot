@@ -366,8 +366,9 @@ bot.on("message", async (message: ChatMessage) => {
       text: "All labels have been cleared! It may take a few minutes for the changes to be reflected.",
     });
   } else {
-    await conversation.sendMessage({
-      text: dedent`
+    await conversation.sendMessage(
+      {
+        text: dedent`
           These are the commands you can use:
 
           - "github: your-username" to verify your GitHub account
@@ -377,6 +378,8 @@ bot.on("message", async (message: ChatMessage) => {
 
           If you want to see the source code or fix a bug check out the repo: https://github.com/hipstersmoothie/github-labeler-bot
         `,
-    });
+      },
+      { resolveFacets: false }
+    );
   }
 });
