@@ -19,11 +19,14 @@ import { DID, HANDLE } from "./constants.js";
 
 const SUCCESS_MESSAGE = "Success! We've verified your GitHub account.";
 
+const log = (msg: string, ...args: unknown[]) =>
+  console.log(`[${new Date().toISOString()}] ${msg}`, ...args);
+
 const bot = new Bot({
   emitChatEvents: true,
 });
 
-let session = getStoredSession();
+let session = await getStoredSession();
 
 if (session) {
   try {
@@ -31,27 +34,33 @@ if (session) {
       accessJwt: session.accessJwt,
       refreshJwt: session.refreshJwt,
       active: true,
-      did: DID,
+      did: DID as `did:${string}:${string}`,
       handle: HANDLE,
     });
-    console.log("Resumed session");
+    log("Session resumed for", HANDLE);
   } catch (err) {
-    console.error(err);
+    log("Failed to resume session, will login fresh:", err);
     session = null;
   }
 }
 
 if (!session) {
+  log("Logging in as", HANDLE);
   const session = await bot.login({
     identifier: process.env.DID!,
     password: process.env.LABELER_PASSWORD!,
   });
 
-  setStoredSession(session);
-  console.log("Logged in");
+  await setStoredSession(session);
+  log("Logged in successfully");
 }
 
 await bot.setChatPreference(IncomingChatPreference.All);
+log("Bot ready, chat events enabled");
+
+bot.on("error", (err) => {
+  console.error(`[${new Date().toISOString()}] Bot error (may be transient):`, err);
+});
 
 bot.on("like", async ({ subject, user }) => {
   // We only care if the user liked the labeler
@@ -59,12 +68,14 @@ bot.on("like", async ({ subject, user }) => {
     return;
   }
 
+  log("Labeler liked by", user.did);
+
   const [err, conversation] = await to(
     bot.getConversationForMembers([user.did])
   );
 
   if (err) {
-    console.error(err);
+    log("Error getting conversation for like:", err);
     return;
   }
 
@@ -85,6 +96,7 @@ bot.on("like", async ({ subject, user }) => {
 
 async function verifyUser(message: ChatMessage, conversation: Conversation) {
   const username = (message.text.split(":")[1] || "").trim();
+  log("Verifying GitHub user:", username, "from", message.senderDid);
 
   if (!username) {
     await conversation.sendMessage({
@@ -100,6 +112,7 @@ async function verifyUser(message: ChatMessage, conversation: Conversation) {
   );
 
   if (socialErr) {
+    log("GitHub API error fetching socials for", username, socialErr);
     await conversation.sendMessage({
       text: dedent`
         Something went wrong getting your social accounts. Please try again.
@@ -113,6 +126,7 @@ async function verifyUser(message: ChatMessage, conversation: Conversation) {
   );
 
   if (!listedBlueskyHandle) {
+    log("User", username, "has no Bluesky in GitHub profile");
     await conversation.sendMessage({
       text: dedent`
         You must list your Bluesky handle in your GitHub profile.
@@ -123,15 +137,14 @@ async function verifyUser(message: ChatMessage, conversation: Conversation) {
     return;
   }
 
-  const [profileErr, userForListedBlueskyHandle] = await to(
-    bot.agent.get("app.bsky.actor.getProfile", {
-      params: {
-        actor: listedBlueskyHandle.url.replace("https://bsky.app/profile/", ""),
-      },
-    })
+  const [profileErr, profile] = await to(
+    bot.getProfile(
+      listedBlueskyHandle.url.replace("https://bsky.app/profile/", "")
+    )
   );
 
   if (profileErr) {
+    log("Could not fetch Bluesky profile for", username, profileErr);
     await conversation.sendMessage({
       text: dedent`
         Couldn't find your Bluesky profile.
@@ -140,7 +153,8 @@ async function verifyUser(message: ChatMessage, conversation: Conversation) {
     return;
   }
 
-  if (userForListedBlueskyHandle.data.did !== message.senderDid) {
+  if (profile.did !== message.senderDid) {
+    log("DID mismatch:", profile.did, "!=", message.senderDid);
     await conversation.sendMessage({
       text: dedent`
         The account your sending the message from is not the same as the account you listed in your GitHub profile.
@@ -149,6 +163,7 @@ async function verifyUser(message: ChatMessage, conversation: Conversation) {
     return;
   }
 
+  log("Verified", username, "->", profile.did);
   await conversation.sendMessage({
     text: dedent`
       ${SUCCESS_MESSAGE}
@@ -208,7 +223,7 @@ async function addRepoLabelForUser(
   conversation: Conversation
 ) {
   const githubUsername = await findGithubUsername(conversation);
-  console.log("Found github username", githubUsername);
+  log("Adding repo label for", message.senderDid, "github:", githubUsername);
 
   if (!githubUsername) {
     await conversation.sendMessage({
@@ -241,6 +256,7 @@ async function addRepoLabelForUser(
   );
 
   if (searchErr) {
+    log("GitHub search error for", input, searchErr);
     await conversation.sendMessage({
       text: dedent`
         Something went wrong searching GitHub for merged PRs. Please try again.
@@ -270,6 +286,7 @@ async function addRepoLabelForUser(
         throw new Error("You aren't a contributor to the repo");
       }
     } catch (err) {
+      log("Contributor check failed for", githubUsername, "on", input, err);
       await conversation.sendMessage({
         text: dedent`
           You have not merged any PRs to the repo so we cannot add the label.
@@ -287,6 +304,7 @@ async function addRepoLabelForUser(
   );
 
   if (repoErr) {
+    log("GitHub repo fetch error for", input, repoErr);
     await conversation.sendMessage({
       text: dedent`
           Something went wrong. ${repoErr.message}
@@ -304,6 +322,7 @@ async function addRepoLabelForUser(
   });
 
   if (didAdd) {
+    log("Added label", input, "for", message.senderDid);
     const ownership = org === githubUsername ? "You own" : "You contributed to";
     await conversation.sendMessage({
       text: dedent`
@@ -313,6 +332,7 @@ async function addRepoLabelForUser(
       `,
     });
   } else {
+    log("Label limit reached for", message.senderDid, "- already has 4 labels");
     await conversation.sendMessage({
       text: dedent`
         You're at the limit of 4 labels! Please /reset if you want to add more.
@@ -324,14 +344,14 @@ async function addRepoLabelForUser(
 }
 
 bot.on("message", async (message: ChatMessage) => {
-  console.log(`Received message: ${message.text}`);
+  log("Message from", message.senderDid, ":", message.text);
 
   const [err, conversation] = await to(
     bot.getConversationForMembers([message.senderDid])
   );
 
   if (err) {
-    console.error(err);
+    log("Error getting conversation:", err);
     return;
   }
 
@@ -340,6 +360,7 @@ bot.on("message", async (message: ChatMessage) => {
   } else if (message.text.match(/^repo:/i)) {
     await addRepoLabelForUser(message, conversation);
   } else if (message.text.trim().match(/^\/reset$/i)) {
+    log("Resetting labels for", message.senderDid);
     await clearUserLabels(message.senderDid);
     await conversation.sendMessage({
       text: "All labels have been cleared! It may take a few minutes for the changes to be reflected.",

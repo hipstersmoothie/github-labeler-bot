@@ -1,10 +1,12 @@
-import { ComAtprotoLabelDefs } from "@atcute/client/lexicons";
 import {
   getLabelerLabelDefinitions,
   setLabelerLabelDefinitions,
 } from "@skyware/labeler/scripts";
 import { DID, PORT, MAXLABELS, SIGNING_KEY } from "./constants.js";
 import { LabelerServer } from "@skyware/labeler";
+
+const log = (msg: string, ...args: unknown[]) =>
+  console.log(`[${new Date().toISOString()}] [labeler] ${msg}`, ...args);
 
 const server = new LabelerServer({
   did: DID,
@@ -13,8 +15,11 @@ const server = new LabelerServer({
 });
 
 server.app.listen({ port: PORT, host: "::" }, (error, address) => {
-  if (error) console.error(error);
-  else console.log(`Labeler server listening on ${address}`);
+  if (error) {
+    log("Failed to start:", error);
+  } else {
+    log("Listening on", address);
+  }
 });
 
 const credentials = {
@@ -25,6 +30,11 @@ const credentials = {
 interface Label {
   name: string;
   description: string;
+}
+
+interface LabelRow {
+  val: string;
+  neg: boolean | number;
 }
 
 const numbers = [
@@ -68,7 +78,7 @@ async function createLabel({ name, description }: Label) {
   const currentLabels = (await getLabelerLabelDefinitions(credentials)) || [];
 
   if (currentLabels.find((label) => label.identifier === identifier)) {
-    console.log(`Label ${identifier} already exists`);
+    log("Label already exists:", identifier);
     return;
   }
 
@@ -83,20 +93,22 @@ async function createLabel({ name, description }: Label) {
       locales: [{ lang: "en", description, name }],
     },
   ]);
-  console.log(`Created label ${identifier}!`);
+  log("Created label definition:", identifier);
 }
 
 export const addUserLabel = async (did: string, label: Label) => {
   const identifier = getIdentifier(label.name);
   // Get the current labels for the did
-  const query = server.db
-    .prepare<string[]>(`SELECT * FROM labels WHERE uri = ?`)
-    .all(did) as ComAtprotoLabelDefs.Label[];
+  const result = await server.db.execute({
+    sql: "SELECT * FROM labels WHERE uri = ?",
+    args: [did],
+  });
+  const rows = result.rows as unknown as LabelRow[];
 
   await createLabel(label);
 
   // make a set of the current labels
-  const labels = query.reduce((set, label) => {
+  const labels = rows.reduce((set, label) => {
     if (!label.neg) set.add(label.val);
     else set.delete(label.val);
     return set;
@@ -104,12 +116,13 @@ export const addUserLabel = async (did: string, label: Label) => {
 
   try {
     if (labels.size < MAXLABELS) {
-      server.createLabel({ uri: did, val: identifier });
-      console.log(`${new Date().toISOString()} Labeled ${did}: ${identifier}`);
+      await server.createLabel({ uri: did, val: identifier });
+      log("Labeled", did, "->", identifier, `(${labels.size + 1}/${MAXLABELS})`);
       return true;
     }
+    log("Label limit reached for", did, "- current labels:", labels.size);
   } catch (err) {
-    console.error(err);
+    log("Failed to add label:", err);
   }
 
   return false;
@@ -117,22 +130,24 @@ export const addUserLabel = async (did: string, label: Label) => {
 
 export const clearUserLabels = async (did: string) => {
   // Get the current labels for the did
-  const query = server.db
-    .prepare<string[]>(`SELECT * FROM labels WHERE uri = ?`)
-    .all(did) as ComAtprotoLabelDefs.Label[];
+  const result = await server.db.execute({
+    sql: "SELECT * FROM labels WHERE uri = ?",
+    args: [did],
+  });
+  const rows = result.rows as unknown as LabelRow[];
 
   // make a set of the current labels
-  const labels = query.reduce((set, label) => {
+  const labels = rows.reduce((set, label) => {
     if (!label.neg) set.add(label.val);
     else set.delete(label.val);
     return set;
   }, new Set<string>());
 
   try {
-    server.createLabels({ uri: did }, { negate: [...labels] });
-    console.log(`${new Date().toISOString()} Deleted labels: ${did}`);
+    await server.createLabels({ uri: did }, { negate: [...labels] });
+    log("Cleared", labels.size, "labels for", did);
   } catch (err) {
-    console.error(err);
+    log("Failed to clear labels:", err);
   }
 };
 
@@ -141,25 +156,22 @@ interface Session {
   refreshJwt: string;
 }
 
-export const getStoredSession = () => {
+export const getStoredSession = async (): Promise<Session | null> => {
   // initialize session table if it doesn't exist
-  server.db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS session (uri TEXT PRIMARY KEY, accessJwt TEXT, refreshJwt TEXT)`
-    )
-    .run();
+  await server.db.execute(
+    `CREATE TABLE IF NOT EXISTS session (uri TEXT PRIMARY KEY, accessJwt TEXT, refreshJwt TEXT)`
+  );
 
   // TODO: https://github.com/skyware-js/bot/issues/16
-  return null as Session | null;
+  return null;
   // return server.db
   //   .prepare<string[]>(`SELECT * FROM session WHERE uri = ?`)
   //   .get(DID) as unknown as Session | null;
 };
 
-export const setStoredSession = (session: Session) => {
-  server.db
-    .prepare(
-      `INSERT OR REPLACE INTO session (uri, accessJwt, refreshJwt) VALUES (?, ?, ?)`
-    )
-    .run(DID, session.accessJwt, session.refreshJwt);
+export const setStoredSession = async (session: Session) => {
+  await server.db.execute({
+    sql: `INSERT OR REPLACE INTO session (uri, accessJwt, refreshJwt) VALUES (?, ?, ?)`,
+    args: [DID, session.accessJwt, session.refreshJwt],
+  });
 };
